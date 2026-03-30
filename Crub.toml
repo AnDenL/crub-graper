@@ -1,0 +1,14 @@
+[package]
+compiler = "clang++"
+standard = "-std=c++2b"
+source_dir = "./" 
+out_dir = "./build"
+
+# flags = []
+# include_dirs = []
+# lib_dirs = []
+# libs = []
+
+[[bin]]
+name = "main"
+path = "/cpp/main.cpp"
