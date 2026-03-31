@@ -350,10 +350,18 @@ fn write_compdb(
         }
 
         if pkg.compiler.contains("clang") {
-            args.push("-fprebuilt-module-path=.".to_string());
-            if unit.exported_module.is_some() || unit.path.extension().unwrap_or_default() == "cppm" {
-                args.push("-Xclang".to_string());
-                args.push("-emit-module-interface".to_string());
+            let abs_obj_dir = current_dir_path.join(obj_dir);
+            args.push(format!("-fprebuilt-module-path={}", abs_obj_dir.to_string_lossy()));
+            
+            if let Some(mod_name) = &unit.exported_module {
+                let pcm_path = abs_obj_dir.join(format!("{}.pcm", mod_name));
+                args.push(format!("-fmodule-output={}", pcm_path.to_string_lossy()));
+                
+                let ext = unit.path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if ext != "cppm" && ext != "ixx" {
+                    args.push("-x".to_string());
+                    args.push("c++-module".to_string());
+                }
             }
         } else {
             args.push("-fmodules-ts".to_string());
@@ -392,8 +400,16 @@ async fn compile_unit(
     let obj_path = ctx.obj_dir.join(&obj_name);
     let cache_file = ctx.obj_dir.join(format!("{}.hash", safe_name));
 
+    // Розширено перевірку кешу: для Clang перевіряємо чи дійсно існує .pcm файл
     let is_cached = if let Ok(cached_hash) = fs::read_to_string(&cache_file) {
-        cached_hash == deep_hash && obj_path.exists()
+        let mut valid = obj_path.exists();
+        if ctx.compiler.contains("clang") {
+            if let Some(mod_name) = &unit.exported_module {
+                let pcm_path = ctx.obj_dir.join(format!("{}.pcm", mod_name));
+                valid = valid && pcm_path.exists();
+            }
+        }
+        cached_hash == deep_hash && valid
     } else {
         false
     };
@@ -417,9 +433,16 @@ async fn compile_unit(
     }
 
     if ctx.compiler.contains("clang") {
-        cmd.arg("-fprebuilt-module-path=.");
-        if unit.exported_module.is_some() || unit.path.extension().unwrap_or_default() == "cppm" {
-            cmd.arg("-Xclang").arg("-emit-module-interface");
+        cmd.arg(format!("-fprebuilt-module-path={}", ctx.obj_dir.display()));
+        
+        if let Some(mod_name) = &unit.exported_module {
+            let pcm_path = ctx.obj_dir.join(format!("{}.pcm", mod_name));
+            cmd.arg(format!("-fmodule-output={}", pcm_path.display()));
+            
+            let ext = unit.path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext != "cppm" && ext != "ixx" {
+                cmd.arg("-x").arg("c++-module");
+            }
         }
     } else {
         cmd.arg("-fmodules-ts");
