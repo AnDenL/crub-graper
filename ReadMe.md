@@ -19,6 +19,11 @@ cargo build --release
 sudo cp target/release/crub-graper /usr/local/bin/
 ```
 
+Also there is an aur package
+```bash
+yay -S crupp-bin
+```
+
 ### Usage
 
 Make Crub.toml file in your project it should look like this
@@ -39,17 +44,21 @@ out_dir = "./build"
 name = "main" # app name
 path = "/src/main.cpp" # your main file
 ```
+You can auto generate it with
+```bash
+crupp toml
+```
 And
 ```bash
-crub-graper build
+crupp build
 ```
 or
 ```bash
-crub-graper run
+crupp run
 ``` 
 Also you can make compilation_commands.json for your language server
 ```bash
-crub-graper compdb
+crupp compdb
 ```
 
 ### Is it compatible with C?
