@@ -1,10 +1,9 @@
 use super::scanner::{discover_sources, TranslationUnit};
-use crate::config::{load_manifest, Package};
+use crate::config::{CompilerType, Package, load_manifest};
 use colored::*;
 use futures::future::join_all;
-use petgraph::algo::toposort;
+use petgraph::algo::{tarjan_scc, toposort};
 use petgraph::graph::{DiGraph, NodeIndex};
-use petgraph::visit::Reversed;
 use petgraph::Direction;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -12,18 +11,16 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::process::Command;
 use indicatif::{ProgressBar, ProgressStyle};
 
-// Context passed to worker threads
 struct BuildContext {
-    compiler: String,
+    compiler: CompilerType,
     standard: String,
     flags: Vec<String>,
     include_dirs: Vec<String>,
     obj_dir: PathBuf,
-    pb: ProgressBar, // Progress bar for thread-safe console output
+    pb: ProgressBar,
 }
 
 #[derive(Serialize)]
@@ -69,7 +66,35 @@ pub async fn build_project(manifest_path: &str, _target_name: Option<&str>) -> R
         }
     }
 
-    let order = toposort(&graph, None).map_err(|_| {"🔄 Cyclic dependency detected in your C++ modules!"})?;
+    let order = match toposort(&graph, None) {
+        Ok(ord) => ord,
+        Err(_) => {
+            let sccs = tarjan_scc(&graph);
+            let cycle = sccs.iter()
+                .find(|scc| scc.len() > 1 || graph.contains_edge(scc[0], scc[0]))
+                .expect("Toposort failed but no SCC found");
+
+            let mut cycle_info = Vec::new();
+            for &node_idx in cycle {
+                let unit_idx = graph[node_idx]; 
+                let unit = &units[unit_idx];
+                
+                let name = unit.exported_module.clone().unwrap_or_else(|| "main".to_string());
+                let path = unit.path.display().to_string();
+                cycle_info.push(format!("{} ({})", name.bright_cyan(), path.dimmed()));
+            }
+
+            let first = cycle_info[0].clone();
+            cycle_info.push(first);
+
+            let error_msg = format!(
+                "\n{}\n{}\n",
+                "Circular dependency detected!".bright_red().bold(),
+                format_cycle_diagram(&cycle_info)
+            );
+            return Err(error_msg);
+        }
+    };
 
     let mut deep_hashes: HashMap<NodeIndex, String> = HashMap::new();
     for &node_idx in &order {
@@ -89,29 +114,13 @@ pub async fn build_project(manifest_path: &str, _target_name: Option<&str>) -> R
         println!("{}", format!("⚠️ Warning: Failed to generate compile_commands.json: {}", e).yellow());
     }
 
-    let pb = ProgressBar::new_spinner();
-    pb.enable_steady_tick(Duration::from_millis(150));
+    let total_nodes = graph.node_count() as u64;
+    let pb = ProgressBar::new(total_nodes);
     pb.set_style(
-        ProgressStyle::default_spinner()
-            .tick_strings(&[
-                "🦀🔪           ❤️",
-                "  🦀🔪        ❤️",
-                "    🦀🔪       ❤️",
-                "      🦀🔪    ❤️",
-                "        🦀🔪   ❤️",
-                "          🦀🔪 ❤️",
-                "            🔪🦀💔",
-                " ❤️          🔪🦀 ",
-                "❤️          🔪🦀 ",
-                " ❤️       🔪🦀   ",
-                "❤️      🔪🦀     ",
-                " ❤️   🔪🦀       ",
-                "❤️  🔪🦀         ",
-                "💔🔪🦀           ",
-                "🦀🔪             ",
-            ])
-            .template("{spinner:.cyan.bold} {msg:.yellow}")
-            .unwrap(),
+        ProgressStyle::default_bar()
+            .template("{spinner:.cyan.bold} [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) {msg:.yellow}")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("=>-")
     );
     pb.set_message("Compiling C++ chaos...");
 
@@ -123,8 +132,6 @@ pub async fn build_project(manifest_path: &str, _target_name: Option<&str>) -> R
         obj_dir: obj_dir.clone(),
         pb: pb.clone(), 
     });
-
-    pb.println(format!("{}", "Starting to build...".bright_cyan().bold()));
 
     let mut in_degrees: HashMap<NodeIndex, usize> = HashMap::new();
     for node in graph.node_indices() {
@@ -167,6 +174,7 @@ pub async fn build_project(manifest_path: &str, _target_name: Option<&str>) -> R
                 Ok(Ok((node_idx, obj_path))) => {
                     obj_files_map.insert(node_idx, obj_path);
                     completed.insert(node_idx);
+                    pb.inc(1); // Оновлюємо прогрес-бар
                     for neighbor in graph.neighbors_directed(node_idx, Direction::Outgoing) {
                         *in_degrees.get_mut(&neighbor).unwrap() -= 1;
                     }
@@ -183,42 +191,43 @@ pub async fn build_project(manifest_path: &str, _target_name: Option<&str>) -> R
         }
     }
 
-    pb.set_message("Linking final binaries...");
+    pb.finish_and_clear();
+    println!("{}", "Compiling finished. Linking targets...".bright_cyan());
 
     if manifest.bin.is_empty() {
-        pb.println(format!("{}", "⚠️ Compiled successfully, but no [[bin]] targets found for linking.".yellow()));
+        println!("{}", "⚠️ Compiled successfully, but no [[bin]] targets found for linking.".yellow());
+    }
+
+    // Збираємо точки входу (entry_nodes) для всіх бінарників, щоб розділити їх
+    let mut entry_nodes = HashMap::new();
+    for bin in &manifest.bin {
+        let clean_bin_path = bin.path.trim_start_matches('/');
+        let target_path = PathBuf::from(clean_bin_path);
+        
+        if let Some((_, &node)) = path_to_node.iter().find(|(path, _)| path.ends_with(&target_path)) {
+            entry_nodes.insert(bin.name.clone(), node);
+        }
     }
 
     for bin in &manifest.bin {
         let out_path = build_dir.join(&bin.name);
-        pb.println(format!("{:>12} {}", "Linking".magenta().bold(), bin.name));
+        println!("{:>12} {}", "Linking".magenta().bold(), bin.name);
 
-        let clean_bin_path = bin.path.trim_start_matches('/');
-        let target_path = PathBuf::from(clean_bin_path);
-
-        let main_node_opt = path_to_node.iter().find_map(|(path, &node)| {
-            if path.ends_with(&target_path) {
-                Some(node)
-            } else {
-                None
-            }
-        });
-
-        let Some(main_node) = main_node_opt else {
-            pb.finish_and_clear();
+        if !entry_nodes.contains_key(&bin.name) {
             return Err(format!("Main file '{}' for target '{}' not found in source directory.", bin.path, bin.name));
         };
 
         let mut required_objects = Vec::new();
-        let mut dfs = petgraph::visit::Dfs::new(Reversed(&graph), main_node);
         
-        while let Some(nx) = dfs.next(Reversed(&graph)) {
-            if let Some(obj_path) = obj_files_map.get(&nx) {
+        // Нова логіка: лінкуємо всі об'єктні файли, ОКРІМ тих, які є entry_point для ІНШИХ бінарників
+        for (node, obj_path) in &obj_files_map {
+            let is_other_entry = entry_nodes.iter().any(|(name, &n)| name != &bin.name && n == *node);
+            if !is_other_entry {
                 required_objects.push(obj_path.clone());
             }
         }
 
-        let mut cmd = Command::new(&pkg.compiler);
+        let mut cmd = Command::new(&pkg.compiler.as_string());
         cmd.arg(&pkg.standard);
 
         for flag in &pkg.flags {
@@ -243,13 +252,11 @@ pub async fn build_project(manifest_path: &str, _target_name: Option<&str>) -> R
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            pb.println(format!("{}\n", stderr.dimmed()));
-            pb.finish_and_clear();
+            println!("{}\n", stderr.dimmed());
             return Err(format!("Failed to link target '{}'", bin.name));
         }
     }
 
-    pb.finish_and_clear();
     println!("{:>12} project!", "Finished".bright_green().bold());
     Ok(())
 }
@@ -286,7 +293,7 @@ pub async fn export_compdb(manifest_path: &str) -> Result<(), String> {
         }
     }
 
-    let order = toposort(&graph, None).map_err(|_| {"🔄 Cyclic dependency detected in your C++ modules!"})?;
+    let order = toposort(&graph, None).map_err(|_| "🔄 Cyclic dependency detected in your C++ modules!".to_string())?;
 
     let mut deep_hashes: HashMap<NodeIndex, String> = HashMap::new();
     for &node_idx in &order {
@@ -325,7 +332,11 @@ fn write_compdb(
         let node_idx = node_indices[i];
         let deep_hash = &deep_hashes[&node_idx];
         
-        let safe_name = unit.path.file_stem().unwrap().to_str().unwrap().replace('.', "_");
+        let safe_name = unit.path.file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("Can't get file name for path: {:?}", unit.path))?
+            .replace('.', "_");
+
         let hash_prefix = &deep_hash[0..8];
         let obj_name = format!("{}_{}.o", safe_name, hash_prefix);
         
@@ -337,7 +348,7 @@ fn write_compdb(
         let abs_output_str = abs_output.to_string_lossy().to_string();
 
         let mut args = vec![
-            pkg.compiler.clone(),
+            pkg.compiler.as_string(),
             pkg.standard.clone(),
             "-c".to_string(),
         ];
@@ -348,24 +359,8 @@ fn write_compdb(
             let abs_inc = current_dir_path.join(inc);
             args.push(format!("-I{}", abs_inc.to_string_lossy()));
         }
-
-        if pkg.compiler.contains("clang") {
-            let abs_obj_dir = current_dir_path.join(obj_dir);
-            args.push(format!("-fprebuilt-module-path={}", abs_obj_dir.to_string_lossy()));
-            
-            if let Some(mod_name) = &unit.exported_module {
-                let pcm_path = abs_obj_dir.join(format!("{}.pcm", mod_name));
-                args.push(format!("-fmodule-output={}", pcm_path.to_string_lossy()));
-                
-                let ext = unit.path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if ext != "cppm" && ext != "ixx" {
-                    args.push("-x".to_string());
-                    args.push("c++-module".to_string());
-                }
-            }
-        } else {
-            args.push("-fmodules-ts".to_string());
-        }
+        let abs_obj_dir = current_dir_path.join(obj_dir);
+        args.extend(pkg.compiler.get_flags(&abs_obj_dir, &unit));
 
         args.push(abs_file_str.clone());
         args.push("-o".to_string());
@@ -393,21 +388,27 @@ async fn compile_unit(
     unit: TranslationUnit,
     deep_hash: String,
 ) -> Result<PathBuf, String> {
-    let safe_name = unit.path.file_stem().unwrap().to_str().unwrap().replace('.', "_");
+    let safe_name = unit.path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("Can't get file name for path: {:?}", unit.path))?
+        .replace('.', "_");
     let hash_prefix = &deep_hash[0..8];
     let obj_name = format!("{}_{}.o", safe_name, hash_prefix);
     
     let obj_path = ctx.obj_dir.join(&obj_name);
     let cache_file = ctx.obj_dir.join(format!("{}.hash", safe_name));
 
-    // Розширено перевірку кешу: для Clang перевіряємо чи дійсно існує .pcm файл
     let is_cached = if let Ok(cached_hash) = fs::read_to_string(&cache_file) {
         let mut valid = obj_path.exists();
-        if ctx.compiler.contains("clang") {
-            if let Some(mod_name) = &unit.exported_module {
-                let pcm_path = ctx.obj_dir.join(format!("{}.pcm", mod_name));
-                valid = valid && pcm_path.exists();
+        match ctx.compiler {
+            CompilerType::Clang => {
+                if let Some(mod_name) = &unit.exported_module {
+                    let pcm_path = ctx.obj_dir.join(format!("{}.pcm", mod_name));
+                    valid = valid && pcm_path.exists();
+                }
             }
+            _ => {},
         }
         cached_hash == deep_hash && valid
     } else {
@@ -421,7 +422,7 @@ async fn compile_unit(
 
     ctx.pb.println(format!("{:>12} {}", "Compiling".green().bold(), unit.path.display()));
 
-    let mut cmd = Command::new(&ctx.compiler);
+    let mut cmd = Command::new(&ctx.compiler.as_string());
     cmd.arg(&ctx.standard).arg("-c");
 
     for flag in &ctx.flags {
@@ -432,28 +433,15 @@ async fn compile_unit(
         cmd.arg(format!("-I{}", inc_dir));
     }
 
-    if ctx.compiler.contains("clang") {
-        cmd.arg(format!("-fprebuilt-module-path={}", ctx.obj_dir.display()));
-        
-        if let Some(mod_name) = &unit.exported_module {
-            let pcm_path = ctx.obj_dir.join(format!("{}.pcm", mod_name));
-            cmd.arg(format!("-fmodule-output={}", pcm_path.display()));
-            
-            let ext = unit.path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if ext != "cppm" && ext != "ixx" {
-                cmd.arg("-x").arg("c++-module");
-            }
-        }
-    } else {
-        cmd.arg("-fmodules-ts");
-    }
+    let module_flags = ctx.compiler.get_flags(&ctx.obj_dir, &unit);
+    cmd.args(module_flags);
 
     cmd.arg(&unit.path).arg("-o").arg(&obj_path);
 
     let output = cmd.output().await.map_err(|e| format!("Failed to spawn compiler: {}", e))?;
 
     if output.status.success() {
-        fs::write(cache_file, &deep_hash).unwrap();
+        fs::write(cache_file, &deep_hash).map_err(|e| e.to_string())?;
         Ok(obj_path)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -461,4 +449,20 @@ async fn compile_unit(
         ctx.pb.println(format!("{}", stderr));
         Err(format!("Compilation aborted for {}", unit.path.display()))
     }
+}
+
+fn format_cycle_diagram(path: &[String]) -> String {
+    let mut diagram = String::new();
+    let indent = "      ";
+    
+    for (i, module) in path.iter().enumerate() {
+        if i == 0 {
+            diagram.push_str(&format!("{}┌──→ {}\n", indent, module.bright_cyan()));
+        } else if i == path.len() - 1 {
+            diagram.push_str(&format!("{}└─── {}\n", indent, module.bright_cyan()));
+        } else {
+            diagram.push_str(&format!("{}│    {}\n", indent, module.bright_cyan()));
+        }
+    }
+    diagram
 }

@@ -1,26 +1,26 @@
 [package]
-name = "crub-graper"
-version = "0.1.0"
+name = "crupp"
+version = "0.2.0"
 edition = "2024"
-description = "CMAKE ON RUST. WHY? I DONT FCKING KNOW"
+description = "Build tool for c++20 modules"
 
 [dependencies]
-tokio = { version = "1.36", features = ["full"] }
+tokio = { version = "1.52.1", features = ["full"] }
 futures = "0.3" 
 
-petgraph = "0.6"
+petgraph = "0.8.3"
 
 regex = "1.10"
 walkdir = "2.4"
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0" 
-toml = "0.8"
+toml = "1.1.2+spec-1.1.0"
 
-clap = { version = "4.5", features = ["derive"] }
-colored = "2.1"
+clap = { version = "4.6.1", features = ["derive"] }
+colored = "3.1.1"
 
-sha2 = "0.10"
+sha2 = "0.11.0"
 hex = "0.4"
 
-indicatif = "0.17"
+indicatif = "0.18.4"

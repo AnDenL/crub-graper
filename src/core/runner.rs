@@ -9,12 +9,10 @@ pub async fn run_target(manifest_path: &str, target_name: Option<&str>) -> Resul
         return Err("No [[bin]] targets found in configuration!".to_string());
     }
 
-    // Select target to run
     let bin_target = if let Some(name) = target_name {
         manifest.bin.iter().find(|b| b.name == name)
             .ok_or_else(|| format!("Target '{}' not found", name))?
     } else {
-        // Run the first one by default if not specified
         &manifest.bin[0]
     };
 
@@ -24,11 +22,8 @@ pub async fn run_target(manifest_path: &str, target_name: Option<&str>) -> Resul
         return Err("Executable not found. Did the build fail?".to_string());
     }
 
-    // Use spawn directly so stdout/stderr are inherited and streamed to the user's terminal
-    let mut cmd = Command::new(&bin_path);
-    
+    let mut cmd = Command::new(&bin_path);    
     let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn process: {}", e))?;
-    
     let status = child.wait().await.map_err(|e| format!("Process wait error: {}", e))?;
 
     if status.success() {

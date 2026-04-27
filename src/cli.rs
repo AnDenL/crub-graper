@@ -33,5 +33,8 @@ pub enum Commands {
         manifest: String,
     },
     /// Generate Crub.toml
-    Toml,
+    Toml {
+        #[arg(default_value = "my_app")]
+        name: String,
+    },
 }
